@@ -8,6 +8,8 @@
 import os
 import tempfile
 import unittest
+from argparse import Namespace
+from functools import partial
 from unittest.mock import patch
 
 import torch
@@ -30,6 +32,7 @@ except ImportError:
     VgfQuantizer = None
 
 from executorch.examples.models.llama import export_llama_lib
+from executorch.examples.models.llama.attention import SDPA
 from executorch.examples.models.llama.export_llama_lib import (
     _export_llama,
     build_args_parser,
@@ -42,9 +45,13 @@ from executorch.extension.llm.export.builder import LLMEdgeManager
 from executorch.extension.llm.export.config.llm_config import (
     LlmConfig,
     MethodConfig,
+    ModelConfig,
     Pt2eQuantize,
+    QuantizationConfig,
+    QuantizeScope,
     VgfQuantizeScope,
 )
+from executorch.extension.llm.export.quantizer_lib import get_ethosu_quantizer
 
 UNWANTED_OPS = [
     "aten_permute_copy_default",
@@ -161,6 +168,345 @@ class ExportLlamaLibTest(unittest.TestCase):
                 ).export()
                 with self.assertRaisesRegex(ValueError, "must use torch.int8"):
                     export_llama_lib._reset_vgf_static_kv_buffers(builder)
+
+    def test_legacy_static_attention_option_is_rejected(self):
+        with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+            build_args_parser().parse_args(["--static_quantize_qk_attention"])
+        self.assertEqual(error.exception.code, 2)
+        with self.assertRaises(TypeError):
+            ModelConfig(static_quantize_qk_attention=True)
+
+    def test_quantized_attention_cli_matches_model_and_quantization_config(self):
+        args = build_args_parser().parse_args(
+            [
+                "--use_kv_cache",
+                "--disable_dynamic_shape",
+                "--static_quantize_kv_cache",
+                "--no-static_quantize_kv_cache_per_channel",
+                "--quantize_scope",
+                "linear_attention",
+                "--attention_activation_bits",
+                "16",
+            ]
+        )
+        config = LlmConfig.from_args(args)
+        self.assertTrue(config.model.static_quantize_kv_cache)
+        self.assertFalse(config.model.static_quantize_kv_cache_per_channel)
+        self.assertEqual(
+            config.quantization.quantize_scope, QuantizeScope.linear_attention
+        )
+        self.assertEqual(config.quantization.attention_activation_bits, 16)
+        defaults = LlmConfig.from_args(build_args_parser().parse_args([]))
+        self.assertTrue(defaults.model.static_quantize_kv_cache_per_channel)
+        self.assertIsNone(defaults.quantization.attention_activation_bits)
+        conflicting = Namespace(
+            quantize_scope="linear_attention", vgf_quantize_scope="linear"
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            LlmConfig.from_args(conflicting)
+
+    def test_legacy_int16_cache_options_are_rejected(self):
+        for args in (["--int16_kv_cache"], ["--int16_kv_cache_scale", "0.01"]):
+            with self.subTest(args=args):
+                with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                    build_args_parser().parse_args(args)
+                self.assertEqual(error.exception.code, 2)
+
+    def test_vgf_cli_generic_scope_reaches_quantizer(self):
+        for scope in ("full", "linear"):
+            for vgf_args in ([], ["--vgf-quantize-scope", "full"]):
+                with self.subTest(scope=scope, vgf_args=vgf_args):
+                    args = build_args_parser().parse_args(
+                        [
+                            "--vgf",
+                            "--pt2e_quantize",
+                            "vgf_16a8w",
+                            "--quantize_scope",
+                            scope,
+                            *vgf_args,
+                        ]
+                    )
+                    config = LlmConfig.from_args(args)
+                    self.assertEqual(
+                        config.quantization.quantize_scope, QuantizeScope(scope)
+                    )
+                    self.assertEqual(
+                        config.backend.vgf.quantize_scope, VgfQuantizeScope(scope)
+                    )
+                    with patch.object(export_llama_lib, "get_vgf_quantizer") as factory:
+                        get_quantizer_and_quant_params(config)
+                    factory.assert_called_once_with(
+                        config.backend.vgf.compile_spec,
+                        config.backend.vgf.compiler_flags,
+                        "vgf_16a8w",
+                        scope,
+                    )
+
+    def test_vgf_cli_rejects_attention_scope(self):
+        args = build_args_parser().parse_args(
+            ["--vgf", "--quantize_scope", "linear_attention"]
+        )
+        with self.assertRaisesRegex(ValueError, "VGF.*linear_attention"):
+            LlmConfig.from_args(args)
+
+    def test_vgf_cli_specific_scope_and_conflicting_generic_scope(self):
+        for generic_scope in (None, "linear", "full", "linear_attention"):
+            with self.subTest(generic_scope=generic_scope):
+                options = ["--vgf", "--vgf-quantize-scope", "linear"]
+                if generic_scope is not None:
+                    options.extend(["--quantize_scope", generic_scope])
+                args = build_args_parser().parse_args(options)
+                if generic_scope in ("full", "linear_attention"):
+                    with self.assertRaisesRegex(ValueError, "conflicts"):
+                        LlmConfig.from_args(args)
+                else:
+                    config = LlmConfig.from_args(args)
+                    self.assertEqual(
+                        config.quantization.quantize_scope, QuantizeScope.linear
+                    )
+                    self.assertEqual(
+                        config.backend.vgf.quantize_scope, VgfQuantizeScope.linear
+                    )
+
+    def test_ethosu_cache_validation_rechecks_mutated_cli_model(self):
+        for storage, invalid, value, error in (
+            ("static_quantize_kv_cache", "use_kv_cache", False, "use_kv_cache"),
+            ("int16_kv_cache", "use_kv_cache", False, "use_kv_cache"),
+            ("static_quantize_kv_cache", "enable_dynamic_shape", True, "static export"),
+            ("int16_kv_cache", "enable_dynamic_shape", True, "static export"),
+            (
+                "static_quantize_kv_cache",
+                "static_quantize_kv_cache_scale",
+                0.0,
+                "positive",
+            ),
+            ("int16_kv_cache", "int16_kv_cache_scale", float("nan"), "positive"),
+            (
+                "int16_kv_cache",
+                "local_global_attention",
+                [16],
+                "does not support local_global_attention",
+            ),
+            (
+                "int16_kv_cache",
+                "use_attention_sink",
+                "4,2048",
+                "does not support use_attention_sink",
+            ),
+        ):
+            with self.subTest(storage=storage, invalid=invalid):
+                settings = {
+                    "use_kv_cache": True,
+                    "enable_dynamic_shape": False,
+                    storage: True,
+                    invalid: value,
+                }
+                with self.assertRaisesRegex(ValueError, error):
+                    ModelConfig(**settings)
+                config = LlmConfig.from_args(Namespace(**settings))
+                with self.assertRaisesRegex(ValueError, error):
+                    export_llama_lib._validate_quantized_kv_cache_args(config)
+
+    def test_ethosu_native_attention_bits_validate_backend_and_cache_dtype(self):
+        config = LlmConfig()
+        config.model.use_kv_cache = True
+        config.model.enable_dynamic_shape = False
+        config.backend.ethosu.enabled = True
+        config.quantization.pt2e_quantize = Pt2eQuantize.ethosu_16a8w
+        config.quantization.quantize_scope = QuantizeScope.linear_attention
+        for bits in (8, 16):
+            config.quantization.attention_activation_bits = bits
+            export_llama_lib._validate_quantized_kv_cache_args(config)
+        config.backend.ethosu.enabled = False
+        with self.assertRaisesRegex(ValueError, "native Ethos-U"):
+            export_llama_lib._validate_quantized_kv_cache_args(config)
+        config.backend.ethosu.enabled = True
+        config.model.int16_kv_cache = True
+        config.quantization.attention_activation_bits = 8
+        with self.assertRaisesRegex(ValueError, "INT8 or FP32 KV storage"):
+            export_llama_lib._validate_quantized_kv_cache_args(config)
+        for bits in (True, 8.0, 4, "8"):
+            with self.subTest(bits=bits), self.assertRaisesRegex(
+                ValueError, "attention_activation_bits"
+            ):
+                QuantizationConfig(attention_activation_bits=bits)
+
+    @unittest.skipUnless(HAS_ARM_BACKEND, "Arm backend is unavailable")
+    def test_ethosu_static_cache_keeps_index_partitionable(self):
+        class Builder:
+            def pt2e_quantize(self, quantizers):
+                return self
+
+            def to_edge_transform_and_lower(self, partitioners):
+                return self
+
+            def to_executorch(self, passes):
+                return self
+
+        config = LlmConfig()
+        config.backend.ethosu.enabled = True
+        config.model.use_kv_cache = True
+        config.model.enable_dynamic_shape = False
+
+        with patch(
+            "executorch.backends.arm.ethosu.partitioner.EthosUPartitioner"
+        ) as partitioner_class:
+            for int16_cache in (False, True):
+                config.model.int16_kv_cache = int16_cache
+                config.model.static_quantize_kv_cache = not int16_cache
+                export_llama_lib._to_edge_and_lower_llama_arm(
+                    Builder(), "tiny", [], [], config
+                )
+                self.assertIsNone(
+                    partitioner_class.call_args.kwargs["additional_checks"]
+                )
+
+            config.model.int16_kv_cache = False
+            config.model.static_quantize_kv_cache = False
+            export_llama_lib._to_edge_and_lower_llama_arm(
+                Builder(), "tiny", [], [], config
+            )
+            self.assertIsNotNone(
+                partitioner_class.call_args.kwargs["additional_checks"]
+            )
+
+    @unittest.skipUnless(HAS_ARM_BACKEND, "Arm backend is unavailable")
+    def test_ethosu_linear_attention_selects_native_sdpa(self):
+        with patch(
+            "executorch.backends.arm.quantizer.arm_quantizer.EthosUQuantizer"
+        ) as quantizer_class:
+            get_ethosu_quantizer(
+                "ethos-u85-256",
+                "default",
+                "default",
+                [],
+                "ethosu_16a8w",
+                "linear_attention",
+            )
+            module_types = [
+                call.args[0]
+                for call in quantizer_class.return_value.set_module_type.call_args_list
+            ]
+            self.assertEqual(module_types, [torch.nn.Linear])
+            quantizer_class.return_value.set_node_finder.assert_called_once()
+
+    @unittest.skipUnless(HAS_ARM_BACKEND, "Arm backend is unavailable")
+    def test_ethosu_native_attention_bits_keep_linear_a16_and_scope(self):
+        with patch(
+            "executorch.backends.arm.quantizer.arm_quantizer.EthosUQuantizer"
+        ) as quantizer_class:
+            for bits in (None, 8, 16):
+                with self.subTest(bits=bits):
+                    quantizer = quantizer_class.return_value
+                    quantizer.reset_mock()
+                    get_ethosu_quantizer(
+                        "ethos-u85-256",
+                        "default",
+                        "default",
+                        [],
+                        "ethosu_16a8w",
+                        "linear_attention",
+                        attention_activation_bits=bits,
+                    )
+                    quantizer.set_global.assert_not_called()
+                    self.assertEqual(quantizer.set_module_type.call_count, 1)
+                    module, config = quantizer.set_module_type.call_args.args
+                    self.assertIs(module, torch.nn.Linear)
+                    self.assertEqual(config.input_activation.dtype, torch.int16)
+                    from executorch.backends.arm.quantizer.quantization_config import (
+                        TOSAQuantizationConfig,
+                    )
+                    from executorch.backends.cortex_m.quantizer.node_finders import (
+                        SDPAFinder,
+                        SDPAScoreFinder,
+                    )
+
+                    calls = quantizer.set_node_finder.call_args_list
+                    self.assertEqual(len(calls), 3 if bits == 8 else 1)
+                    self.assertIs(type(calls[0].args[1]), SDPAFinder)
+                    self.assertEqual(
+                        calls[0].args[0].input_activation.dtype,
+                        torch.int8 if bits == 8 else torch.int16,
+                    )
+                    attention_config = calls[-1].args[0]
+                    self.assertEqual(
+                        attention_config.input_activation.dtype,
+                        torch.int8 if bits == 8 else torch.int16,
+                    )
+                    if bits == 8:
+                        self.assertIsInstance(calls[1].args[1], SDPAScoreFinder)
+                        self.assertEqual(
+                            calls[1].args[0].input_activation.dtype, torch.int16
+                        )
+                        self.assertIs(type(attention_config), TOSAQuantizationConfig)
+                        self.assertTrue(callable(attention_config.output_activation))
+                        self.assertEqual(calls[-1].args[1].role, "qk")
+
+    def test_ethosu_native_attention_requires_per_tensor_cache_storage(self):
+        config = LlmConfig()
+        config.model.use_kv_cache = True
+        config.model.enable_dynamic_shape = False
+        config.model.static_quantize_kv_cache = True
+        config.backend.ethosu.enabled = True
+        config.backend.ethosu.delegate_mutable_buffers = True
+        config.quantization.pt2e_quantize = Pt2eQuantize.ethosu_16a8w
+        config.quantization.quantize_scope = QuantizeScope.linear_attention
+        with self.assertRaisesRegex(ValueError, "per_channel=False"):
+            export_llama_lib._validate_quantized_kv_cache_args(config)
+        config.model.static_quantize_kv_cache_per_channel = False
+        export_llama_lib._validate_quantized_kv_cache_args(config)
+        config.model.static_quantize_kv_cache_per_channel = True
+        config.quantization.pt2e_quantize = Pt2eQuantize.ethosu_8a8w
+        config.quantization.quantize_scope = QuantizeScope.full
+        export_llama_lib._validate_quantized_kv_cache_args(config)
+
+    def test_ethosu_native_attention_keeps_sdpa_source_and_int8_cache(self):
+        transforms = export_llama_lib._get_source_transforms(
+            export_llama_lib.DType.fp32,
+            use_kv_cache=True,
+            static_quantize_kv_cache=True,
+            static_quantize_kv_cache_per_channel=False,
+            ethosu=True,
+        )
+        cache_transforms = [
+            transform
+            for transform in transforms
+            if isinstance(transform, partial)
+            and transform.func
+            is export_llama_lib.replace_kv_cache_with_static_quantized_kv_cache
+        ]
+        self.assertEqual(len(cache_transforms), 1)
+        self.assertFalse(cache_transforms[0].keywords["use_per_channel"])
+        attention = torch.nn.Module()
+        attention.SDPA = SDPA(8, 4, 2, 4)
+        original_sdpa = attention.SDPA
+        for transform in transforms:
+            attention = transform(attention)
+        self.assertIs(attention.SDPA, original_sdpa)
+
+    def test_ethosu_int16_cache_requires_delegate_owned_a16_attention(self):
+        config = LlmConfig()
+        config.model.use_kv_cache = True
+        config.model.enable_dynamic_shape = False
+        config.model.int16_kv_cache = True
+        config.backend.ethosu.enabled = True
+        config.quantization.pt2e_quantize = Pt2eQuantize.ethosu_16a8w
+        config.quantization.quantize_scope = QuantizeScope.linear_attention
+
+        with self.assertRaisesRegex(ValueError, "delegate_mutable_buffers"):
+            export_llama_lib._validate_quantized_kv_cache_args(config)
+
+        config.backend.ethosu.delegate_mutable_buffers = True
+        export_llama_lib._validate_quantized_kv_cache_args(config)
+
+        config.quantization.quantize_scope = QuantizeScope.linear
+        with self.assertRaisesRegex(ValueError, "linear_attention"):
+            export_llama_lib._validate_quantized_kv_cache_args(config)
+
+        config.quantization.quantize_scope = QuantizeScope.linear_attention
+        config.model.static_quantize_kv_cache = True
+        with self.assertRaisesRegex(ValueError, "INT8 KV cache"):
+            export_llama_lib._validate_quantized_kv_cache_args(config)
 
     def _assert_routes_to(self, lowering, coreml=False, vulkan=False, qnn=False):
         """Assert which lowering an export routes to, without running one."""

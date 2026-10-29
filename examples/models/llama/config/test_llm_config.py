@@ -42,6 +42,49 @@ class TestValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             ModelConfig(static_quantize_kv_cache=True)
 
+    def test_int16_kv_requires_static_cache_shapes(self):
+        with self.assertRaisesRegex(ValueError, "use_kv_cache"):
+            ModelConfig(int16_kv_cache=True)
+        with self.assertRaisesRegex(ValueError, "static export shapes"):
+            ModelConfig(use_kv_cache=True, int16_kv_cache=True)
+
+    def test_int16_kv_is_exclusive_with_int8_cache(self):
+        with self.assertRaisesRegex(ValueError, "INT8 KV cache"):
+            ModelConfig(
+                use_kv_cache=True,
+                enable_dynamic_shape=False,
+                int16_kv_cache=True,
+                static_quantize_kv_cache=True,
+            )
+
+    def test_int16_kv_rejects_invalid_scale(self):
+        for scale in (0.0, float("nan"), float("inf")):
+            with self.subTest(scale=scale), self.assertRaises(ValueError):
+                ModelConfig(int16_kv_cache_scale=scale)
+
+    def test_int16_kv_rejects_specialized_cache_modes(self):
+        for option, value in (
+            ("local_global_attention", [16]),
+            ("use_attention_sink", "4,2048"),
+        ):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                ValueError, f"int16_kv_cache does not support {option}"
+            ):
+                ModelConfig(
+                    use_kv_cache=True,
+                    enable_dynamic_shape=False,
+                    int16_kv_cache=True,
+                    **{option: value},
+                )
+
+    def test_int16_kv_accepts_standard_cache(self):
+        config = ModelConfig(
+            use_kv_cache=True,
+            enable_dynamic_shape=False,
+            int16_kv_cache=True,
+        )
+        self.assertTrue(config.int16_kv_cache)
+
     def test_static_quantize_kv_rejects_dynamic_shape(self):
         with self.assertRaises(ValueError):
             ModelConfig(use_kv_cache=True, static_quantize_kv_cache=True)

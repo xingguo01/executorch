@@ -355,6 +355,7 @@ def get_ethosu_quantizer(
     extra_flags: Optional[List[str]],
     pt2e_quantize: str,
     quantize_scope: str,
+    attention_activation_bits: Optional[int] = None,
 ):
     from executorch.backends.arm.ethosu.compile_spec import EthosUCompileSpec
     from executorch.backends.arm.quantizer.arm_quantizer import (
@@ -379,11 +380,29 @@ def get_ethosu_quantizer(
     else:
         raise ValueError(f"Unsupported quantizer specification {pt2e_quantize}")
 
+    if attention_activation_bits is not None and (
+        type(attention_activation_bits) is not int
+        or attention_activation_bits not in (8, 16)
+        or quantize_scope != "linear_attention"
+        or pt2e_quantize != "ethosu_16a8w"
+    ):
+        raise ValueError(
+            "attention_activation_bits requires native Ethos-U "
+            "ethosu_16a8w with linear_attention scope"
+        )
+    if quantize_scope == "linear_attention" and pt2e_quantize != "ethosu_16a8w":
+        raise ValueError("Ethos-U linear_attention quantization requires ethosu_16a8w")
+    attention_config = (
+        get_symmetric_quantization_config()
+        if attention_activation_bits == 8
+        else quantization_config
+    )
     _apply_arm_quantize_scope(
         quantizer,
         quantization_config=quantization_config,
         quantize_scope=quantize_scope,
         backend_name="Ethos-U",
+        attention_config=attention_config,
     )
     return quantizer
 
@@ -394,11 +413,47 @@ def _apply_arm_quantize_scope(
     quantization_config,
     quantize_scope: str,
     backend_name: str,
+    attention_config=None,
 ):
     if quantize_scope == "full":
         quantizer.set_global(quantization_config)
     elif quantize_scope == "linear":
         quantizer.set_module_type(torch.nn.Linear, quantization_config)
+    elif quantize_scope == "linear_attention" and backend_name == "Ethos-U":
+        quantizer.set_module_type(torch.nn.Linear, quantization_config)
+        from dataclasses import replace
+        from functools import partial
+
+        from executorch.backends.arm.quantizer.arm_quantizer import (
+            get_symmetric_a16w8_quantization_config,
+        )
+        from executorch.backends.arm.quantizer.quantization_config import (
+            get_int8_matmul_accumulator_qspec,
+        )
+        from executorch.backends.cortex_m.quantizer.node_finders import (
+            SDPAFinder,
+            SDPAMatmulFinder,
+            SDPAScoreFinder,
+        )
+
+        # Later, more specific finders take precedence over the full region.
+        quantizer.set_node_finder(attention_config, SDPAFinder())
+        if attention_config.input_activation.dtype == torch.int8:
+            quantizer.set_node_finder(
+                get_symmetric_a16w8_quantization_config(), SDPAScoreFinder()
+            )
+            input_qspec = replace(
+                attention_config.input_activation,
+                qscheme=torch.per_tensor_symmetric,
+            )
+            accumulator_config = replace(
+                attention_config,
+                input_activation=input_qspec,
+                output_activation=partial(
+                    get_int8_matmul_accumulator_qspec, input_qspec=input_qspec
+                ),
+            )
+            quantizer.set_node_finder(accumulator_config, SDPAMatmulFinder("qk"))
     else:
         raise ValueError(
             f"Unsupported {backend_name} quantization scope {quantize_scope}"

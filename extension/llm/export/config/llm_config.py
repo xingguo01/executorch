@@ -195,6 +195,13 @@ class ModelConfig:
         use_kv_cache: Whether to use KV cache.
         quantize_kv_cache: Whether to perform int8 per token quantization on the KV cache.
         static_quantize_kv_cache: Whether to use static-qparams int8 KV cache storage.
+        static_quantize_kv_cache_per_channel: Whether cache scales vary by
+            channel. Disable for native Ethos-U ``linear_attention`` scope.
+        int16_kv_cache: Whether to use experimental Vela-specific INT16
+            EXT-VARIABLE cache storage with A16W8 attention. Configure through
+            Hydra with ``model.int16_kv_cache=True``; the legacy CLI does not
+            expose the required Ethos-U backend settings.
+        int16_kv_cache_scale: Fixed symmetric per-tensor INT16 cache scale.
         local_global_attention: List of integers specifying local and global attention pattern.
             e.g., [0, 16, 0, 16] to specify that every other layer is sliding window of 16.
             [0, 16, 32] pattern specifies 2nd and 3rd layers have sliding windows of 16 and 32.
@@ -212,7 +219,10 @@ class ModelConfig:
     use_kv_cache: bool = False
     quantize_kv_cache: bool = False
     static_quantize_kv_cache: bool = False
+    static_quantize_kv_cache_per_channel: bool = True
     static_quantize_kv_cache_scale: float = 1.0 / 127.0
+    int16_kv_cache: bool = False
+    int16_kv_cache_scale: float = 1.0 / 32767.0
     local_global_attention: Optional[List[int]] = None
     # Replace eager MOEFeedForward modules with the
     # `llama::quantized_moe_ffn` portable-runtime custom op.
@@ -220,7 +230,10 @@ class ModelConfig:
 
     def __post_init__(self):
         self._validate_attention_sink()
+        self.validate_kv_cache()
 
+    def validate_kv_cache(self):  # noqa: C901
+        """Validate cache settings after construction or CLI configuration."""
         if self.quantize_kv_cache and not self.use_kv_cache:
             raise ValueError(
                 "Cannot quantize the KV cache (quantize_kv_cache) without enabling the KV cache (use_kv_cache)"
@@ -230,6 +243,26 @@ class ModelConfig:
             raise ValueError(
                 "Cannot statically quantize the KV cache (static_quantize_kv_cache) without enabling the KV cache (use_kv_cache)"
             )
+
+        if self.int16_kv_cache and not self.use_kv_cache:
+            raise ValueError("int16_kv_cache requires use_kv_cache")
+
+        if self.int16_kv_cache and (
+            self.quantize_kv_cache or self.static_quantize_kv_cache
+        ):
+            raise ValueError("int16_kv_cache cannot be combined with an INT8 KV cache")
+
+        if self.int16_kv_cache and self.enable_dynamic_shape:
+            raise ValueError("int16_kv_cache requires static export shapes")
+
+        if self.int16_kv_cache and self.use_sdpa_with_kv_cache:
+            raise ValueError("int16_kv_cache requires standard tensor cache updates")
+
+        if self.int16_kv_cache and self.local_global_attention:
+            raise ValueError("int16_kv_cache does not support local_global_attention")
+
+        if self.int16_kv_cache and self.use_attention_sink:
+            raise ValueError("int16_kv_cache does not support use_attention_sink")
 
         if self.quantize_kv_cache and self.static_quantize_kv_cache:
             raise ValueError(
@@ -258,6 +291,12 @@ class ModelConfig:
             raise ValueError(
                 "static_quantize_kv_cache_scale must be finite and positive"
             )
+
+        if (
+            not math.isfinite(self.int16_kv_cache_scale)
+            or self.int16_kv_cache_scale <= 0
+        ):
+            raise ValueError("int16_kv_cache_scale must be finite and positive")
 
         if self.local_global_attention and not self.use_kv_cache:
             raise ValueError(
@@ -438,6 +477,7 @@ class SpinQuant(str, Enum):
 class QuantizeScope(str, Enum):
     full = "full"
     linear = "linear"
+    linear_attention = "linear_attention"
 
 
 @dataclass
@@ -459,7 +499,10 @@ class QuantizationConfig:
         use_qat: Whether the checkpoint is quantization-awarely trained.
         quantize_scope: Scope for Arm PT2E quantization. "full" quantizes the
             full supported graph, while "linear" limits quantization to
-            torch.nn.Linear modules.
+            torch.nn.Linear modules. "linear_attention" also quantizes
+            native SDPA through node-finder policies.
+        attention_activation_bits: Optional native Ethos-U attention override
+            for linear_attention scope. Linear layers retain the main recipe.
         calibration_tasks: Tasks for GPTQ calibration from lm_eval.
         calibration_limit: Number of samples used for calibration from lm_eval.
         calibration_seq_length: Sequence length for GPTQ calibration from lm_eval.
@@ -485,6 +528,7 @@ class QuantizationConfig:
     use_spin_quant: Optional[SpinQuant] = None
     use_qat: bool = False
     quantize_scope: QuantizeScope = QuantizeScope.full
+    attention_activation_bits: Optional[int] = None
     calibration_tasks: Optional[List[str]] = None
     calibration_limit: Optional[int] = None
     calibration_seq_length: Optional[int] = None
@@ -492,6 +536,11 @@ class QuantizationConfig:
     use_hqq: bool = True
 
     def __post_init__(self):
+        if self.attention_activation_bits is not None and (
+            type(self.attention_activation_bits) is not int
+            or self.attention_activation_bits not in (8, 16)
+        ):
+            raise ValueError("attention_activation_bits must be 8, 16, or None")
         if self.qmode:
             self._validate_qmode()
 
@@ -641,6 +690,7 @@ class EthosUConfig:
     memory_mode: str = "default"
     system_config: str = "default"
     extra_flags: List[str] = field(default_factory=list)
+    delegate_mutable_buffers: bool = False
 
 
 class VgfQuantizeScope(str, Enum):
@@ -779,6 +829,14 @@ class LlmConfig:
             llm_config.model.quantize_kv_cache = args.quantize_kv_cache
         if hasattr(args, "static_quantize_kv_cache"):
             llm_config.model.static_quantize_kv_cache = args.static_quantize_kv_cache
+        if hasattr(args, "static_quantize_kv_cache_per_channel"):
+            llm_config.model.static_quantize_kv_cache_per_channel = (
+                args.static_quantize_kv_cache_per_channel
+            )
+        if hasattr(args, "int16_kv_cache"):
+            llm_config.model.int16_kv_cache = args.int16_kv_cache
+        if hasattr(args, "int16_kv_cache_scale"):
+            llm_config.model.int16_kv_cache_scale = args.int16_kv_cache_scale
         if hasattr(args, "static_quantize_kv_cache_scale"):
             llm_config.model.static_quantize_kv_cache_scale = (
                 args.static_quantize_kv_cache_scale
@@ -813,6 +871,10 @@ class LlmConfig:
             llm_config.quantization.embedding_quantize = args.embedding_quantize
         if hasattr(args, "pt2e_quantize") and args.pt2e_quantize:
             llm_config.quantization.pt2e_quantize = Pt2eQuantize(args.pt2e_quantize)
+        if hasattr(args, "attention_activation_bits"):
+            llm_config.quantization.attention_activation_bits = (
+                args.attention_activation_bits
+            )
         if hasattr(args, "group_size"):
             llm_config.quantization.group_size = args.group_size
         if hasattr(args, "use_spin_quant") and args.use_spin_quant:
@@ -906,6 +968,22 @@ class LlmConfig:
             llm_config.quantization.quantize_scope = QuantizeScope(
                 args.vgf_quantize_scope
             )
+        if hasattr(args, "quantize_scope") and args.quantize_scope:
+            if hasattr(args, "vgf_quantize_scope") and args.vgf_quantize_scope not in (
+                None,
+                "full",
+                args.quantize_scope,
+            ):
+                raise ValueError("quantize_scope conflicts with vgf_quantize_scope")
+            llm_config.quantization.quantize_scope = QuantizeScope(args.quantize_scope)
+            if llm_config.backend.vgf.enabled:
+                if args.quantize_scope == "linear_attention":
+                    raise ValueError(
+                        "VGF does not support linear_attention quantization"
+                    )
+                llm_config.backend.vgf.quantize_scope = VgfQuantizeScope(
+                    args.quantize_scope
+                )
 
         # Samsung
         if hasattr(args, "samsung"):

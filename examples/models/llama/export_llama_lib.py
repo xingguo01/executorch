@@ -13,7 +13,6 @@ import argparse
 import copy
 import json
 import logging
-import math
 import os
 import re
 import shlex
@@ -346,6 +345,25 @@ def build_args_parser() -> argparse.ArgumentParser:
         default=False,
         action="store_true",
         help="Whether or not to export a model using static-qparams int8 KV cache storage",
+    )
+    parser.add_argument(
+        "--static_quantize_kv_cache_per_channel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use channel-wise cache scales; disable for native Ethos-U attention",
+    )
+    parser.add_argument(
+        "--attention_activation_bits",
+        type=int,
+        choices=(8, 16),
+        default=None,
+        help="Native Ethos-U SDPA precision; does not change Linear or KV storage",
+    )
+    parser.add_argument(
+        "--quantize_scope",
+        choices=("full", "linear", "linear_attention"),
+        default=None,
+        help="Arm PT2E quantization scope",
     )
     parser.add_argument(
         "--static_quantize_kv_cache_scale",
@@ -828,10 +846,15 @@ def _calibrate_static_kv_cache(
 ) -> None:
     tasks = llm_config.quantization.calibration_tasks
     if not tasks:
+        configured_scale = (
+            llm_config.model.int16_kv_cache_scale
+            if llm_config.model.int16_kv_cache
+            else llm_config.model.static_quantize_kv_cache_scale
+        )
         logging.warning(
-            "No calibration task provided for static KV cache; using the configured "
+            "No calibration task provided for quantized KV cache; using the configured "
             "fixed scale %s",
-            llm_config.model.static_quantize_kv_cache_scale,
+            configured_scale,
         )
         return
     if llm_config.quantization.calibration_seq_length is None:
@@ -976,7 +999,10 @@ def _prepare_for_llama_export(llm_config: LlmConfig) -> LLMEdgeManager:
             use_sdpa_with_kv_cache=llm_config.model.use_sdpa_with_kv_cache,
             quantize_kv_cache=llm_config.model.quantize_kv_cache,
             static_quantize_kv_cache=llm_config.model.static_quantize_kv_cache,
+            static_quantize_kv_cache_per_channel=llm_config.model.static_quantize_kv_cache_per_channel,
             static_quantize_kv_cache_scale=llm_config.model.static_quantize_kv_cache_scale,
+            int16_kv_cache=llm_config.model.int16_kv_cache,
+            int16_kv_cache_scale=llm_config.model.int16_kv_cache_scale,
             use_kv_cache=llm_config.model.use_kv_cache,
             qnn=llm_config.backend.qnn.enabled,
             vgf=llm_config.backend.vgf.enabled,
@@ -1061,6 +1087,7 @@ def get_quantizer_and_quant_params(llm_config):
             llm_config.backend.ethosu.extra_flags,
             llm_config.quantization.pt2e_quantize.value,
             arm_quantize_scope,
+            attention_activation_bits=llm_config.quantization.attention_activation_bits,
         )
         quantizers.append(ethosu_quantizer)
     if llm_config.backend.vgf.enabled and llm_config.quantization.pt2e_quantize:
@@ -1100,39 +1127,66 @@ def _qmode_type(value):
     )
 
 
-def _validate_static_kv_cache_args(llm_config):
-    # from_args mutates ModelConfig after __post_init__, so validate again here.
-    if not llm_config.model.static_quantize_kv_cache:
-        return
-    if not llm_config.model.use_kv_cache:
-        raise ValueError("static_quantize_kv_cache requires model.use_kv_cache=True")
-    if llm_config.model.quantize_kv_cache:
-        raise ValueError(
-            "Cannot enable both quantize_kv_cache and static_quantize_kv_cache"
+def _validate_quantized_kv_cache_args(llm_config):  # noqa: C901
+    # CLI conversion updates ModelConfig after construction.
+    llm_config.model.validate_kv_cache()
+    quantizer = llm_config.quantization.pt2e_quantize
+    recipe = (
+        quantizer.value if quantizer is not None else None,
+        llm_config.quantization.quantize_scope.value,
+    )
+    attention_bits = llm_config.quantization.attention_activation_bits
+    if attention_bits is not None:
+        if (
+            type(attention_bits) is not int
+            or attention_bits not in (8, 16)
+            or not llm_config.backend.ethosu.enabled
+            or recipe != ("ethosu_16a8w", "linear_attention")
+        ):
+            raise ValueError(
+                "attention_activation_bits requires native Ethos-U "
+                "ethosu_16a8w with linear_attention scope"
+            )
+        if attention_bits == 8 and llm_config.model.int16_kv_cache:
+            raise ValueError(
+                "Native A8 attention currently requires INT8 or FP32 KV storage"
+            )
+    if llm_config.backend.ethosu.delegate_mutable_buffers and not (
+        llm_config.model.use_kv_cache
+        and (
+            llm_config.model.static_quantize_kv_cache or llm_config.model.int16_kv_cache
         )
-    if llm_config.model.enable_dynamic_shape:
-        raise ValueError(
-            "static_quantize_kv_cache requires model.enable_dynamic_shape=False"
-        )
-    if llm_config.model.local_global_attention:
-        raise ValueError(
-            "static_quantize_kv_cache does not support model.local_global_attention"
-        )
-    if llm_config.model.use_attention_sink:
-        raise ValueError(
-            "static_quantize_kv_cache does not support model.use_attention_sink"
-        )
-    if (
-        not math.isfinite(llm_config.model.static_quantize_kv_cache_scale)
-        or llm_config.model.static_quantize_kv_cache_scale <= 0
     ):
         raise ValueError(
-            "model.static_quantize_kv_cache_scale must be finite and positive"
+            "Ethos-U delegate-owned state requires a static INT8 or INT16 KV cache"
+        )
+    if (
+        llm_config.model.static_quantize_kv_cache
+        and llm_config.backend.ethosu.enabled
+        and llm_config.backend.ethosu.delegate_mutable_buffers
+        and llm_config.quantization.quantize_scope == "linear_attention"
+        and llm_config.model.static_quantize_kv_cache_per_channel
+    ):
+        raise ValueError(
+            "Native Ethos-U delegate-owned attention requires "
+            "model.static_quantize_kv_cache_per_channel=False; "
+            "per-channel cache arithmetic does not preserve delegated state "
+            "ownership with linear_attention scope"
+        )
+    if not llm_config.model.int16_kv_cache:
+        return
+    if not llm_config.backend.ethosu.enabled:
+        raise ValueError("int16_kv_cache requires the Ethos-U backend")
+    if not llm_config.backend.ethosu.delegate_mutable_buffers:
+        raise ValueError("int16_kv_cache requires delegate_mutable_buffers=True")
+    if recipe != ("ethosu_16a8w", "linear_attention"):
+        raise ValueError(
+            "INT16 KV/attention requires ethosu_16a8w with linear_attention scope"
         )
 
 
 def _validate_args(llm_config):
-    _validate_static_kv_cache_args(llm_config)
+    _validate_quantized_kv_cache_args(llm_config)
 
     if llm_config.export.max_context_length < llm_config.export.max_seq_length:
         raise ValueError(
@@ -1375,11 +1429,14 @@ def _to_edge_and_lower_llama_arm(
             ),
             extra_flags=llm_config.backend.ethosu.extra_flags,
         )
+        if llm_config.backend.ethosu.delegate_mutable_buffers:
+            compile_spec.set_delegate_mutable_buffers()
 
         additional_checks = []
         if (
             llm_config.model.use_kv_cache
             and not llm_config.model.static_quantize_kv_cache
+            and not llm_config.model.int16_kv_cache
         ):
             from torch.fx.passes.operator_support import OperatorSupportBase
 
@@ -1820,7 +1877,7 @@ def _export_llama_multimethod(llm_config: LlmConfig) -> LLMEdgeManager:
 
 def _export_llama(llm_config: LlmConfig) -> LLMEdgeManager:  # noqa: C901
     _validate_args(llm_config)
-    if llm_config.model.static_quantize_kv_cache:
+    if llm_config.model.static_quantize_kv_cache or llm_config.model.int16_kv_cache:
         _ensure_static_kvq_out_variants(llm_config)
 
     # Check for multimethod export
@@ -1850,7 +1907,7 @@ def _export_llama(llm_config: LlmConfig) -> LLMEdgeManager:  # noqa: C901
 
     # export_to_edge
     builder_manager = _prepare_for_llama_export(llm_config)
-    if llm_config.model.static_quantize_kv_cache:
+    if llm_config.model.static_quantize_kv_cache or llm_config.model.int16_kv_cache:
         _calibrate_static_kv_cache(builder_manager, llm_config)
     if (
         llm_config.backend.tosa.enabled
@@ -2136,6 +2193,9 @@ def _get_source_transforms(  # noqa
     quantize_kv_cache: bool = False,
     static_quantize_kv_cache: bool = False,
     static_quantize_kv_cache_scale: float = 1.0 / 127.0,
+    static_quantize_kv_cache_per_channel: bool = True,
+    int16_kv_cache: bool = False,
+    int16_kv_cache_scale: float = 1.0 / 32767.0,
     use_kv_cache: bool = False,
     qnn: bool = False,
     vgf: bool = False,
@@ -2178,6 +2238,8 @@ def _get_source_transforms(  # noqa
         use_sdpa_with_kv_cache: Whether to use SDPA with KV cache.
         quantize_kv_cache: Whether to quantize KV cache.
         static_quantize_kv_cache: Whether to use static-qparams int8 KV cache storage.
+        static_quantize_kv_cache_per_channel: Whether static cache scales vary
+            by channel instead of using one scale per cache tensor.
         use_kv_cache: Whether to use KV cache.
         qnn: Whether to use QNN.
         vgf: Whether to use VGF.
@@ -2317,6 +2379,19 @@ def _get_source_transforms(  # noqa
                 replace_kv_cache_with_static_quantized_kv_cache,
                 scale=static_quantize_kv_cache_scale,
                 use_custom_update_cache_op=not (vgf or tosa or ethosu),
+                use_per_channel=static_quantize_kv_cache_per_channel,
+            )
+        )
+
+    if int16_kv_cache:
+        assert use_kv_cache, "int16_kv_cache requires use_kv_cache=True"
+        transforms.append(
+            partial(
+                replace_kv_cache_with_static_quantized_kv_cache,
+                scale=int16_kv_cache_scale,
+                use_custom_update_cache_op=False,
+                use_per_channel=False,
+                quantized_cache_dtype=torch.int16,
             )
         )
 
